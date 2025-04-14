@@ -3,6 +3,7 @@
 //writen by TNM WISH and Cook LTD
 //IDF VERSION 5.4.0
 //NOTE: PLEASE do not use dynamic memory allocation
+//GITHUB: https://github.com/tanim2023/Barebone-ether1-OTA-mqtt-template.git
 //----------------------------------------------------------------------------------------------
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
