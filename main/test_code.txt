@@ -1,0 +1,301 @@
+/*
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_netif.h"
+#include "esp_eth.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "sdkconfig.h"
+#include "esp_eth_driver.h"
+#include "nvs_flash.h"
+#include "ethernet_init.h"
+#include "esp_tls.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "esp_app_format.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
+
+#define DEVICE_NAME             "ota_base"
+#define MQTT_BROKER_URI         "mqtt://192.168.0.50"
+#define MQTT_UPDATE_TOPIC       "device_name/update"
+#define MQTT_STATUS_TOPIC       "device_name/status"
+#define MQTT_LWT_MESSAGE        "Disconnected"
+#define MQTT_CONNECTED_MESSAGE  "Connected"
+static esp_mqtt_client_handle_t mqtt_client = NULL;
+
+
+#define BLINK_GPIO GPIO_NUM_2
+
+typedef struct {
+    char device[64]; // Adjust size as needed
+    char url[256];   // Adjust size as needed
+} OtaType;
+
+typedef struct {
+    char topic[64]; // Adjust size as needed
+    char data[256]; // Adjust size as needed
+} MqttMessage;
+
+
+static const char *TAG = "ota_eth_starter";
+static esp_eth_handle_t s_eth_handle = NULL;
+static QueueHandle_t mqtt_message_queue = NULL;
+static QueueHandle_t ota_queue = NULL;
+
+
+static void eth_event_handler(void *arg, esp_event_base_t event_base,
+                             int32_t event_id, void *event_data)
+{
+    uint8_t mac_addr[6] = {0};
+    switch (event_id) {
+    case ETHERNET_EVENT_CONNECTED:
+        esp_eth_ioctl(s_eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
+        ESP_LOGI(TAG, "Ethernet Link Up");
+        ESP_LOGI(TAG, "Ethernet MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        break;
+    case ETHERNET_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "Ethernet Link Down");
+        break;
+    case ETHERNET_EVENT_START:
+        ESP_LOGI(TAG, "Ethernet Started");
+        break;
+    case ETHERNET_EVENT_STOP:
+        ESP_LOGI(TAG, "Ethernet Stopped");
+        break;
+    default:
+        break;
+    }
+}
+
+
+void blink_gpio_task(void *pvParameters) {
+    gpio_reset_pin(BLINK_GPIO);
+    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+    while (1) {
+        gpio_set_level(BLINK_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(BLINK_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void http_ota_task(void *pvParameter) {
+    char stat_msg[50];
+    while (1) {
+        OtaType ota_msg;
+        if (xQueueReceive(ota_queue, &ota_msg, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "Received OTA request for URL: %s", ota_msg.url);
+            ESP_LOGI(TAG, "Device ID: %s", ota_msg.device);
+            
+            // Perform OTA update using the data
+            if (strlen(ota_msg.url) > 0) {
+                ESP_LOGI(TAG, "valid OTA URL");
+                snprintf(stat_msg, sizeof(stat_msg), "{ \"device\": %s, \"status\": \"valid OTA URL\" }", DEVICE_NAME);
+                esp_mqtt_client_publish(mqtt_client, MQTT_STATUS_TOPIC, stat_msg, 0, 1, 0);
+                esp_http_client_config_t http_config = {
+                    .url = ota_msg.url,
+                    .disable_auto_redirect = false  // Allow redirects if needed
+                };
+
+                esp_https_ota_config_t ota_config = {
+                    .http_config = &http_config,
+                    .bulk_flash_erase = true
+                };
+
+                esp_err_t ret = esp_https_ota(&ota_config);
+                if (ret == ESP_OK) {
+                    snprintf(stat_msg, sizeof(stat_msg), "{ \"device\": %s, \"status\": \"valid OTA URL\"}", DEVICE_NAME);
+                    esp_mqtt_client_publish(mqtt_client, MQTT_STATUS_TOPIC, stat_msg, 0, 1, 0);
+                    ESP_LOGI(TAG, "OTA Success! Restaring...");
+                    esp_ota_mark_app_valid_cancel_rollback(); // <-- ADD THIS
+                    esp_restart();
+                } else {
+                    ESP_LOGE(TAG, "OTA Failed: %s", esp_err_to_name(ret));
+                    snprintf(stat_msg, sizeof(stat_msg), "{\"device\": %s, \"status\": \"OTA Failed: %s\"}", DEVICE_NAME,  esp_err_to_name(ret));
+                    esp_mqtt_client_publish(mqtt_client, MQTT_STATUS_TOPIC, stat_msg, 0, 1, 0);
+                }
+            } else {
+                ESP_LOGE(TAG, "Invalid OTA URL");
+                snprintf(stat_msg, sizeof(stat_msg), "{ \"device\": %s, \"status\": \"Invalid URL\"}", DEVICE_NAME);
+                esp_mqtt_client_publish(mqtt_client, MQTT_STATUS_TOPIC, stat_msg, 0, 1, 0);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }            
+
+}
+
+static void mqtt_task_distribution(void *pvParameter) {
+    while (1) {
+        MqttMessage message;
+        if (xQueueReceive(mqtt_message_queue, &message, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "(mqtt_task_distribution) Received MQTT message on topic %s: %s", message.topic, message.data);
+            if (strcmp(message.topic, MQTT_UPDATE_TOPIC) == 0) {
+                // Create a message with fixed size
+                OtaType ota_msg = {0}; // Zero-initialize the structure
+                
+                // Parse JSON and fill the structure
+                cJSON *root = cJSON_Parse(message.data);
+                if (root) {
+                    cJSON *url = cJSON_GetObjectItem(root, "ota_url");
+                    if (cJSON_IsString(url) && url->valuestring) {
+                        strncpy(ota_msg.url, url->valuestring, sizeof(ota_msg.url) - 1);
+                    }
+                    
+                    cJSON *device = cJSON_GetObjectItem(root, "device");
+                    if (cJSON_IsString(device) && device->valuestring) {
+                        strncpy(ota_msg.device, device->valuestring, sizeof(ota_msg.device) - 1);
+                    }
+                    
+                    cJSON_Delete(root);
+                    
+                    // Send the fixed-size structure
+                    if (xQueueSend(ota_queue, &ota_msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        ESP_LOGI(TAG, "Message sent to ota_queue successfully");
+                    } else {
+                        ESP_LOGE(TAG, "Failed to send message to ota_queue");
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Failed to parse JSON message");
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    switch(event->event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connected");
+            esp_mqtt_client_subscribe(mqtt_client, MQTT_UPDATE_TOPIC, 1);
+            esp_mqtt_client_publish(mqtt_client, MQTT_STATUS_TOPIC, MQTT_CONNECTED_MESSAGE, 0, 1, 0);
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "MQTT disconnected");
+            break;
+
+        case MQTT_EVENT_DATA:
+            ESP_LOGI(TAG, "MQTT data received on topic %.*s", event->topic_len, event->topic);
+            ESP_LOGI(TAG, "(mqtt_event_handler) Received JSON: %.*s", event->data_len, event->data);
+            MqttMessage message;
+            strncpy(message.topic, event->topic, event->topic_len);
+            message.topic[event->topic_len] = '\0';
+            strncpy(message.data, event->data, event->data_len);
+            message.data[event->data_len] = '\0';
+            if (xQueueSend(mqtt_message_queue, &message, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    ESP_LOGI(TAG, "Message sent to queue successfully");
+                } else {
+                    ESP_LOGE(TAG, "Failed to send message to queue");
+                    // Handle the failure, e.g., drop the message or retry later
+                }
+            
+            break;
+
+        default:
+            break;
+    }
+}
+// Initialize MQTT 
+static void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+        .session.last_will.topic = MQTT_STATUS_TOPIC,
+        .session.last_will.msg = MQTT_LWT_MESSAGE,
+        .session.keepalive = 60,
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+
+
+
+
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+                                {
+                                ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+                                const esp_netif_ip_info_t *ip_info = &event->ip_info;
+                                ESP_LOGI(TAG, "Ethernet Got IP Address");
+                                ESP_LOGI(TAG, "___________________");
+                                ESP_LOGI(TAG, "IP:" IPSTR, IP2STR(&ip_info->ip));
+                                ESP_LOGI(TAG, "MASK:" IPSTR, IP2STR(&ip_info->netmask));
+                                ESP_LOGI(TAG, "GW:" IPSTR, IP2STR(&ip_info->gw));
+                                ESP_LOGI(TAG, "___________________");
+                                mqtt_app_start();
+                                }
+static void ethernet_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
+    
+    esp_netif_dhcpc_stop(eth_netif);
+    esp_netif_ip_info_t ip_info;
+    esp_netif_str_to_ip4("192.168.0.90",&ip_info.ip);
+    esp_netif_str_to_ip4("255.255.255.0",&ip_info.netmask);
+    esp_netif_str_to_ip4("192.168.0.1",&ip_info.gw);
+    esp_netif_set_ip_info(eth_netif, &ip_info);
+
+    uint8_t eth_port_cnt = 0;
+    esp_eth_handle_t *eth_handles;
+    example_eth_init(&eth_handles, &eth_port_cnt);
+    
+    esp_eth_handle_t eth_handle = eth_handles[0];
+    free(eth_handles);
+
+    esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
+    
+    esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL);
+
+    esp_eth_start(eth_handle);
+}
+
+void app_main(void)
+{
+//Queue ininialization
+mqtt_message_queue = xQueueCreate(10, sizeof(MqttMessage));
+ota_queue = xQueueCreate(10, sizeof(OtaType));
+
+// Check if previous OTA needs rollback
+ESP_LOGI(TAG, "I am here!!");
+     const esp_partition_t *running = esp_ota_get_running_partition();
+     esp_ota_img_states_t ota_state;
+        if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+            if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+                ESP_LOGW(TAG, "Previous OTA marked invalid. Rolling back...");
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            }
+        }
+
+    // Initialize NVS  
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ethernet_init();
+    
+    // Start Blink Task
+    xTaskCreate(blink_gpio_task, "blink_gpio_task", 2048, NULL, 5, NULL);
+    xTaskCreate(mqtt_task_distribution, "mqtt_task_distribution", 4096, NULL, 5, NULL);
+    xTaskCreate(http_ota_task, "http_ota_task", 10240, NULL, 5, NULL);
+}
+*/
