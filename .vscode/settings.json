@@ -1,0 +1,17 @@
+{
+    "C_Cpp.intelliSenseEngine": "default",
+    "idf.espIdfPathWin": "C:\\Users\\tanim\\esp\\v5.4\\esp-idf",
+    "idf.toolsPathWin": "C:\\Users\\tanim\\.espressif",
+    "idf.pythonInstallPath": "C:\\Users\\tanim\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+    "files.associations": {
+        "ethernet_init.h": "c",
+        "sdkconfig.h": "c",
+        "esp_eth_driver.h": "c",
+        "gpio.h": "c",
+        "esp_http_client.h": "c",
+        "mqtt.h": "c",
+        "task.h": "c"
+    },
+    "idf.portWin": "COM11",
+    "idf.flashType": "UART"
+}
