@@ -5,10 +5,7 @@ build/*
 # But DO track .bin files in build folder
 !build/*.bin
 
-# Optional: Also track the build folder structure itself
-!build/
 .pio/
-*.bin
 *.elf
 .devcontainer/
 .vscode/
