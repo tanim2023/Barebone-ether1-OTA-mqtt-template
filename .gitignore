@@ -11,5 +11,4 @@ build/*
 *.bin
 *.elf
 .devcontainer/
-.devcontainer/
 .vscode/
